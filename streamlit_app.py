@@ -1,56 +1,98 @@
+#"vHxFCBV5OZbQYxQrSg0NugMNSdpCTdZ4"
 import streamlit as st
-from openai import OpenAI
+import os
+import json
+from mistralai import Mistral, models
+from astrapy import DataAPIClient
+import torch
+from transformers import BertTokenizer, BertModel
+import time
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+# Mistral AI API configuration
+api_key = "vHxFCBV5OZbQYxQrSg0NugMNSdpCTdZ4"
+model = "mistral-large-latest"
+client_mistral = Mistral(api_key=api_key)
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# Astra DB configuration
+client_astra = DataAPIClient("AstraCS:ruQuZHsXMkHUYFjfcsXzITOs:b0545554bc378e2b8ede0e41815074a83f4a5e0a3056f76e7154f1ad247fe39f")
+db = client_astra.get_database_by_api_endpoint("https://c983bb3f-4942-41ce-bee8-d38ff2fca9b4-us-east1.apps.astra.datastax.com")
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+# BERT model and tokenizer configuration
+model_name = "bert-base-uncased"
+tokenizer = BertTokenizer.from_pretrained(model_name)
+bert_model = BertModel.from_pretrained(model_name)
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+def refine_user_input(user_input):
+    inputs = tokenizer(user_input, return_tensors='pt')
+    outputs = bert_model(**inputs)
+    pooled_output = outputs.pooler_output
+    refined_input = torch.nn.functional.normalize(pooled_output)
+    return refined_input.detach().numpy()[0].tolist()
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+def search_astra_db(query):
+    collection_name = "nyaya"
+    collection = db.get_collection(collection_name)
+    results = collection.find(
+        sort={"$vectorize": query},
+        limit=2,
+        projection={"$vectorize": True},
+        include_similarity=True,
+    )
+    return "\n".join([str(document) for document in results])
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+def handle_conversation(user_input, prev_response):
+    # Refine user input
+    refined_input = refine_user_input(user_input)
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    # Search Astra DB
+    astra_results = search_astra_db(user_input)
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+    # Prepare chat message
+    messages = []
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    # Append previous bot response
+    if prev_response:
+        messages.append({"role": "assistant", "content": prev_response})
+
+    # Append new user input
+    messages.append({"role": "user", "content": user_input})
+
+    # Append Astra DB search results as a user message for now
+    messages.append({"role": "user", "content": f"Search results: {astra_results}"})
+
+    # Invoke Mistral AI API with rate limiting and exponential backoff
+    retry_count = 0
+    while retry_count < 5:  # Try up to 5 times
+        try:
+            chat_response = client_mistral.chat.complete(
+                model=model,
+                messages=messages,
+            )
+            break  # If successful, break the retry loop
+        except models.SDKError as e:
+            if "Requests rate limit exceeded" in str(e):
+                st.write(f"Rate limit exceeded. Waiting {2 ** retry_count * 60} seconds...")
+                time.sleep(2 ** retry_count * 60)  # Exponential backoff
+                retry_count += 1
+            else:
+                raise
+
+    # Return response
+    response = chat_response.choices[0].message.content
+    return response
+
+# Streamlit app
+st.title("AI Judicial Advisor")
+
+if "prev_response" not in st.session_state:
+    st.session_state.prev_response = ""
+
+user_input = st.text_input("You:")
+
+if st.button("Send"):
+    if user_input.lower() == "exit":
+        st.stop()
+
+    response = handle_conversation(user_input, st.session_state.prev_response)
+    st.session_state.prev_response = response
+    st.write("Bot:", response)
